@@ -440,39 +440,47 @@ app.post("/event/:eventId/like", authenticateUser, async (req, res) => {
   }
 });
 
-// Update Event (Admin Only)
-app.put("/event/:eventId", upload.single("image"), authenticateUser, isAdmin, async (req, res) => {
-  const eventId = req.params.eventId;
-  const eventData = req.body;
-
-  // Update the image path if a new image is uploaded
-  eventData.image = req.file ? `uploads/${req.file.filename}` : eventData.image;
+app.put("/event/:eventId", upload.single("image"), authenticateUser, canModifyEvent, async (req, res) => {
+  const { eventId } = req.params;
+  const updates = req.body;
 
   try {
-    const updatedEvent = await Event.findByIdAndUpdate(eventId, eventData, { new: true });
-    if (!updatedEvent) {
-      return res.status(404).json({ message: "Event not found" });
+    const event = await Event.findById(eventId);
+    if (!event) {
+      console.log("Event not found:", eventId);
+      return res.status(404).json({ error: "Event not found" });
     }
-    res.json(updatedEvent);
+
+    if (req.file) {
+      updates.image = `uploads/${req.file.filename}`;
+    }
+
+    Object.assign(event, updates);
+    await event.save();
+    console.log("Event updated successfully:", event);
+    res.json(event);
   } catch (error) {
-    console.error("Error updating the event:", error);
-    res.status(500).json({ message: "Server error" });
+    console.error("Error updating event:", error);
+    res.status(500).json({ error: "Failed to update event" });
   }
 });
 
 // Delete Event (Admin Only)
-app.delete("/event/:eventId", authenticateUser, isAdmin, async (req, res) => {
-  const eventId = req.params.eventId;
+app.delete("/event/:eventId", authenticateUser, canModifyEvent, async (req, res) => {
+  const { eventId } = req.params;
 
   try {
     const deletedEvent = await Event.findByIdAndDelete(eventId);
     if (!deletedEvent) {
-      return res.status(404).json({ message: "Event not found" });
+      console.log("Event not found:", eventId);
+      return res.status(404).json({ error: "Event not found" });
     }
-    res.status(204).send();
+
+    console.log("Event deleted successfully:", deletedEvent);
+    res.json({ message: "Event deleted successfully" });
   } catch (error) {
-    console.error("Error deleting the event:", error);
-    res.status(500).json({ message: "Server error" });
+    console.error("Error deleting event:", error);
+    res.status(500).json({ error: "Failed to delete event" });
   }
 });
 
