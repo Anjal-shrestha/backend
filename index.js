@@ -651,11 +651,13 @@ app.get("/admin/analytics", authenticateUser, isAdmin, async (req, res) => {
     const totalEarnings = await Ticket.aggregate([
       { $group: { _id: null, total: { $sum: "$ticketDetails.ticketprice" } } },
     ]);
-
+   
+    const totalOrganizers = await UserModel.countDocuments({ role: "organizer" });
     res.status(200).json({
       totalEvents,
       totalTicketsSold: totalTicketsSold[0]?.total || 0,
       totalEarnings: totalEarnings[0]?.total || 0,
+      totalOrganizers,
     });
   } catch (error) {
     console.error("Error fetching analytics:", error);
