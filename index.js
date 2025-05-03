@@ -10,10 +10,10 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const QRCode = require("qrcode");
-
+const session = require('express-session');
 const Ticket = require("./models/Ticket");
 const Event = require("./models/Event");
-
+const Notification = require("./models/Notification");
 const app = express();
 
 // Constants
@@ -30,7 +30,12 @@ const uploadDir = './uploads';
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
 }
-
+app.use(session({
+  secret: 'your_session_secret',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { secure: false } // Set to true if using HTTPS
+}));
 // Serve static files from the 'uploads' directory
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -196,8 +201,171 @@ app.get("/profile", authenticateUser, async (req, res) => {
 app.post("/logout", (req, res) => {
   res.cookie("token", "").json(true);
 });
+// Initiate eSewa Payment
+app.post("/initiate-esewa-payment", authenticateUser, async (req, res) => {
+  const { eventId, quantity } = req.body;
+  const userId = req.user.id;
 
+  if (!eventId || !quantity || quantity <= 0) {
+    return res.status(400).json({ error: "Invalid event ID or quantity" });
+  }
 
+  try {
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    const ticketPrice = parseFloat(event.ticketPrice);
+    if (isNaN(ticketPrice) || ticketPrice <= 0) {
+      return res.status(400).json({ error: "Invalid ticket price" });
+    }
+
+    const totalPrice = ticketPrice * parseInt(quantity);
+
+    // Generate a unique transaction ID for eSewa
+    const pid = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // Save transaction info temporarily (you can store this in DB later)
+    req.session.esewaTxn = {
+      userId,
+      eventId,
+      quantity,
+      amount: totalPrice,
+      pid,
+      status: "pending"
+    };
+
+    // Prepare eSewa redirect URL and form data
+    const esewaUrl = process.env.ESEWA_BASE_URL;
+    
+    const formData = {
+      amt: totalPrice.toFixed(2),
+      psc: 0, // Service charge
+      pdc: 0, // Delivery charge
+      txAmt: 0,
+      tAmt: totalPrice.toFixed(2),
+      pid: pid,
+      scd: process.env.ESEWA_MERCHANT_CODE,
+      su: process.env.PAYMENT_SUCCESS_URL,
+      fu: process.env.PAYMENT_FAILURE_URL,
+    };
+
+    res.json({
+      redirectUrl: esewaUrl,
+      formData
+    });
+
+  } catch (error) {
+    console.error("Error initiating eSewa payment:", error);
+    res.status(500).json({ error: "Failed to initiate eSewa payment" });
+  }
+});
+// Confirm eSewa Payment and Book Ticket
+app.post("/confirm-esewa-payment", authenticateUser, async (req, res) => {
+  const { refId, oid } = req.body;
+  const userId = req.user.id;
+
+  try {
+    const pendingTxn = req.session.esewaTxn;
+
+    if (!pendingTxn || pendingTxn.pid !== oid) {
+      return res.status(400).json({ error: "Invalid or expired transaction" });
+    }
+
+    const event = await Event.findById(pendingTxn.eventId);
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    // Update event ticket count
+    event.Quantity -= pendingTxn.quantity;
+    event.ticketsSold += pendingTxn.quantity;
+    await event.save();
+
+    // Generate QR Code
+    let qrCode;
+    try {
+      const qrData = JSON.stringify({
+        userId,
+        eventId: pendingTxn.eventId,
+        bookingDate: new Date(),
+        transactionId: oid
+      });
+      qrCode = await QRCode.toDataURL(qrData);
+    } catch (qrError) {
+      console.error("QR Error:", qrError);
+      return res.status(500).json({ error: "Failed to generate QR code" });
+    }
+
+    // Save ticket
+    // Instead of creating one ticket, create multiple
+const ticketPromises = [];
+
+for (let i = 0; i < pendingTxn.quantity; i++) {
+  // Generate unique data for each QR
+  const singleQRData = JSON.stringify({
+    userId,
+    eventId: pendingTxn.eventId,
+    bookingDate: new Date(),
+    ticketId: `${pendingTxn.pid}_ticket_${i + 1}`
+  });
+
+  const qr = await QRCode.toDataURL(singleQRData);
+
+  const newTicket = new Ticket({
+    userid: userId,
+    eventid: pendingTxn.eventId,
+    ticketDetails: {
+      name: req.user.name,
+      email: req.user.email,
+      eventname: event.title,
+      eventdate: event.eventDate,
+      eventtime: event.eventTime,
+      ticketprice: event.ticketPrice,
+      qr: qr
+    },
+    count: 1 // Each ticket is for 1 person
+  });
+
+  ticketPromises.push(newTicket.save());
+}
+
+await Promise.all(ticketPromises);
+
+    // Clear session
+    delete req.session.esewaTxn;
+
+    res.json({ message: "Payment confirmed and ticket booked!", ticket: newTicket });
+
+  } catch (error) {
+    console.error("Error confirming payment:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+// Get latest ticket of logged-in user
+app.get("/user/tickets/latest", authenticateUser, async (req, res) => {
+  try {
+    const purchaseId = req.query.purchaseId;
+
+    let query = { userid: req.user.id };
+    if (purchaseId) {
+      query.purchaseId = purchaseId;
+    }
+
+    const tickets = await Ticket.find(query).sort({ createdAt: -1 });
+
+    if (!tickets.length) {
+      return res.status(404).json({ error: "No tickets found" });
+    }
+
+    res.json(tickets);
+
+  } catch (error) {
+    console.error("Error fetching user tickets:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 // Add comment to an event
 app.post('/event/:eventId/comment', authenticateUser, async (req, res) => {
   const { eventId } = req.params;
@@ -326,7 +494,7 @@ app.delete("/organizer/:id", authenticateUser, isAdmin, async (req, res) => {
 
 // Create Event (Admin or Organizer)
 app.post("/createEvent", upload.single("image"), authenticateUser, isOrganizerOrAdmin, async (req, res) => {
-  const { id, role } = req.user;
+  const { id, role, name } = req.user;
   const eventData = req.body;
 
   try {
@@ -351,6 +519,21 @@ app.post("/createEvent", upload.single("image"), authenticateUser, isOrganizerOr
     const newEvent = new Event(eventData);
     await newEvent.save();
 
+    // Now that event is saved, fetch fully populated event
+    const event = await Event.findById(newEvent._id); // or populate if needed
+
+    // Notify all admins
+    const admins = await UserModel.find({ role: "admin" });
+
+    for (const admin of admins) {
+      await Notification.create({
+        userId: admin._id,
+        message: `New event "${event.title}" created by ${name || "Unknown User"}`,
+        relatedId: event._id,
+        relatedType: "Event"
+      });
+    }
+
     res.status(201).json(newEvent);
   } catch (err) {
     console.error("Error creating event:", err);
@@ -362,13 +545,28 @@ app.put("/approveEvent/:eventId", authenticateUser, isAdmin, async (req, res) =>
   const { eventId } = req.params;
 
   try {
-    const event = await Event.findById(eventId);
+    // Fetch event with owner populated
+    const event = await Event.findById(eventId).populate("owner");
+    
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
 
+    // Approve event
     event.approved = true;
     await event.save();
+
+    // Create notification for organizer
+    if (event.owner && event.owner._id) {
+      await Notification.create({
+        userId: event.owner._id,
+        message: `Your event "${event.title}" has been approved.`,
+        relatedId: event._id,
+        relatedType: "Event"
+      });
+    } else {
+      console.warn("Owner not found or missing for event:", eventId);
+    }
 
     res.status(200).json({ message: "Event approved successfully", event });
   } catch (error) {
@@ -421,6 +619,89 @@ app.get("/event/:id", async (req, res) => {
   }
 });
 
+// GET /notifications
+app.get("/notifications", authenticateUser, async (req, res) => {
+  try {
+    const notifications = await Notification.find({ userId: req.user.id })
+      .sort({ createdAt: -1 });
+
+    res.json(notifications);
+  } catch (error) {
+    console.error("Error fetching notifications:", error);
+    res.status(500).json({ error: "Failed to fetch notifications" });
+  }
+});
+// PUT /notifications/:notificationId/read
+app.put("/notifications/:notificationId/read", authenticateUser, async (req, res) => {
+  try {
+    const { notificationId } = req.params;
+
+    const notification = await Notification.findById(notificationId);
+
+    if (!notification || notification.userId.toString() !== req.user.id) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+
+    notification.read = true;
+    await notification.save();
+
+    res.json({ message: "Notification marked as read" });
+  } catch (error) {
+    console.error("Error marking notification as read:", error);
+    res.status(500).json({ error: "Failed to update notification" });
+  }
+});// PUT /notifications/read-all
+app.put("/notifications/read-all", authenticateUser, async (req, res) => {
+  try {
+    await Notification.updateMany(
+      { userId: req.user.id },
+      { read: true }
+    );
+
+    res.json({ message: "All notifications marked as read" });
+  } catch (error) {
+    console.error("Error marking all notifications as read:", error);
+    res.status(500).json({ error: "Failed to update notifications" });
+  }
+});
+// GET notifications for logged-in user
+app.get("/notifications", authenticateUser, async (req, res) => {
+  try {
+    const notifications = await Notification.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    res.json(notifications);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch notifications" });
+  }
+});
+
+// PUT mark single notification as read
+app.put("/notifications/:notificationId/read", authenticateUser, async (req, res) => {
+  try {
+    const { notificationId } = req.params;
+    const notification = await Notification.findById(notificationId);
+
+    if (!notification || notification.userId.toString() !== req.user.id) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+
+    notification.read = true;
+    await notification.save();
+
+    res.json({ message: "Notification marked as read" });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to update notification" });
+  }
+});
+
+// PUT mark all as read
+app.put("/notifications/read-all", authenticateUser, async (req, res) => {
+  try {
+    await Notification.updateMany({ userId: req.user.id }, { read: true });
+    res.json({ message: "All notifications marked as read" });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to update notifications" });
+  }
+});
 // Like Event (User Only)
 app.post("/event/:eventId/like", authenticateUser, async (req, res) => {
   const eventId = req.params.eventId;
@@ -487,6 +768,13 @@ app.delete("/event/:eventId", authenticateUser, canModifyEvent, async (req, res)
 // Reject Event (Admin Only)
 app.put("/rejectEvent/:eventId", authenticateUser, isAdmin, async (req, res) => {
   const { eventId } = req.params;
+  const event = await Event.findById(req.params.eventId).populate("owner");
+  await Notification.create({
+    userId: event.owner._id,
+    message: `Your event "${event.title}" has been rejected.`,
+    relatedId: event._id,
+    relatedType: "Event"
+  });
   try {
     const event = await Event.findById(eventId);
     if (!event) {
