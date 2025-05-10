@@ -15,11 +15,19 @@ const Ticket = require("./models/Ticket");
 const Event = require("./models/Event");
 const Notification = require("./models/Notification");
 const app = express();
-
+const PendingTransaction = require("./models/PendingTransaction");
 // Constants
 const bcryptSalt = bcrypt.genSaltSync(10);
 const jwtSecret = process.env.JWT_SECRET || "default_secret";
-
+const nodemailer = require('nodemailer');
+const otpGenerator = require('otp-generator');
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
@@ -135,7 +143,65 @@ createAdminIfNotExists();
 app.get("/test", (req, res) => {
   res.json("test ok");
 });
+// Store OTPs temporarily (add this near your other constants)
+const otpStorage = {};
 
+// Send OTP endpoint
+app.post('/send-otp', async (req, res) => {
+  const { email } = req.body;
+  
+  // Validate email format
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Please provide a valid email address' });
+  }
+
+  // Generate OTP
+  const otp = otpGenerator.generate(6, {
+    digits: true,
+    alphabets: false,
+    upperCase: false,
+    specialChars: false
+  });
+  
+  // Store OTP with expiration (10 minutes)
+  otpStorage[email] = {
+    otp,
+    expiresAt: Date.now() + 600000
+  };
+  
+  // Send email
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: 'Your OTP for Email Verification',
+    text: `Your OTP is: ${otp}\nThis OTP will expire in 10 minutes.`
+  };
+  
+  try {
+    await transporter.sendMail(mailOptions);
+    res.status(200).json({ message: 'OTP sent successfully' });
+  } catch (error) {
+    console.error('Error sending email:', error);
+    res.status(500).json({ error: 'Failed to send OTP' });
+  }
+});
+
+// Verify OTP endpoint
+app.post('/verify-otp', async (req, res) => {
+  const { email, otp } = req.body;
+  
+  // Check if OTP exists and isn't expired
+  if (!otpStorage[email] || otpStorage[email].expiresAt < Date.now()) {
+    return res.status(400).json({ error: 'OTP expired or invalid' });
+  }
+  
+  if (otpStorage[email].otp === otp) {
+    delete otpStorage[email]; // OTP used, remove it
+    res.status(200).json({ message: 'Email verified successfully' });
+  } else {
+    res.status(400).json({ error: 'Invalid OTP' });
+  }
+});
 // Register User
 app.post("/register", async (req, res) => {
   const { name, email, password } = req.body;
@@ -189,8 +255,17 @@ app.post("/login", async (req, res) => {
 // Get Profile
 app.get("/profile", authenticateUser, async (req, res) => {
   try {
-    const { name, email, _id, role } = await UserModel.findById(req.user.id);
-    res.json({ name, email, _id, role });
+    const user = await UserModel.findById(req.user.id).populate('savedEvents');
+    const tickets = await Ticket.find({ userid: req.user.id }).sort({ createdAt: -1 });
+
+    res.json({
+      name: user.name,
+      email: user.email,
+      _id: user._id,
+      role: user.role,
+      tickets,
+      savedEvents: user.savedEvents || []
+    });
   } catch (error) {
     console.error("Error fetching profile:", error);
     res.status(500).json({ error: "Server error" });
@@ -202,6 +277,7 @@ app.post("/logout", (req, res) => {
   res.cookie("token", "").json(true);
 });
 // Initiate eSewa Payment
+// POST /initiate-esewa-payment
 app.post("/initiate-esewa-payment", authenticateUser, async (req, res) => {
   const { eventId, quantity } = req.body;
   const userId = req.user.id;
@@ -223,193 +299,304 @@ app.post("/initiate-esewa-payment", authenticateUser, async (req, res) => {
 
     const totalPrice = ticketPrice * parseInt(quantity);
 
-    // Generate a unique transaction ID for eSewa
+    // Generate unique transaction ID
     const pid = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    // Save transaction info temporarily (you can store this in DB later)
-    req.session.esewaTxn = {
+    // Save transaction to DB
+    const transaction = new PendingTransaction({
       userId,
       eventId,
       quantity,
       amount: totalPrice,
       pid,
       status: "pending"
-    };
+    });
 
-    // Prepare eSewa redirect URL and form data
+    await transaction.save();
+
+    // Prepare eSewa form data
     const esewaUrl = process.env.ESEWA_BASE_URL;
-    
     const formData = {
       amt: totalPrice.toFixed(2),
-      psc: 0, // Service charge
-      pdc: 0, // Delivery charge
+      psc: 0,
+      pdc: 0,
       txAmt: 0,
       tAmt: totalPrice.toFixed(2),
       pid: pid,
       scd: process.env.ESEWA_MERCHANT_CODE,
-      su: process.env.PAYMENT_SUCCESS_URL,
-      fu: process.env.PAYMENT_FAILURE_URL,
+      su: `${process.env.PAYMENT_SUCCESS_URL}?userId=${userId}`,
+      fu: `${process.env.PAYMENT_FAILURE_URL}?userId=${userId}`
     };
 
-    res.json({
-      redirectUrl: esewaUrl,
-      formData
-    });
-
+    res.json({ redirectUrl: esewaUrl, formData });
   } catch (error) {
-    console.error("Error initiating eSewa payment:", error);
+    console.error("Error initiating eSewa payment:", error.message);
     res.status(500).json({ error: "Failed to initiate eSewa payment" });
   }
 });
+
+// Confirm eSewa Payment and Book Ticket
+// POST /confirm-esewa-payment
+
 // Confirm eSewa Payment and Book Ticket
 app.post("/confirm-esewa-payment", authenticateUser, async (req, res) => {
   const { refId, oid } = req.body;
   const userId = req.user.id;
 
   try {
-    const pendingTxn = req.session.esewaTxn;
+    // First, add a transaction lock check
+    const lockKey = `payment_lock_${oid}`;
+    if (req.session[lockKey]) {
+      return res.status(409).json({
+        success: true,
+        message: "Payment is already being processed",
+      });
+    }
+    
+    // Set a lock
+    req.session[lockKey] = true;
 
-    if (!pendingTxn || pendingTxn.pid !== oid) {
-      return res.status(400).json({ error: "Invalid or expired transaction" });
+    // Check if this transaction exists and belongs to this user
+    const pendingTxn = await PendingTransaction.findOne({ pid: oid });
+    if (!pendingTxn || pendingTxn.userId.toString() !== userId) {
+      delete req.session[lockKey]; // Release lock
+      return res.status(400).json({ error: "Invalid or unauthorized transaction" });
+    }
+
+    // IMPORTANT: Check if tickets were already generated for this transaction
+    const existingTickets = await Ticket.find({ purchaseId: oid });
+    if (existingTickets.length > 0) {
+      delete req.session[lockKey]; // Release lock
+      return res.status(200).json({
+        success: true,
+        message: "Tickets already generated for this transaction",
+        ticket: existingTickets,
+        eventId: pendingTxn.eventId,
+        quantity: existingTickets.length
+      });
     }
 
     const event = await Event.findById(pendingTxn.eventId);
     if (!event) {
+      delete req.session[lockKey]; // Release lock
       return res.status(404).json({ error: "Event not found" });
     }
 
-    // Update event ticket count
-    event.Quantity -= pendingTxn.quantity;
-    event.ticketsSold += pendingTxn.quantity;
-    await event.save();
+    if (event.Quantity < pendingTxn.quantity) {
+      delete req.session[lockKey]; // Release lock
+      return res.status(400).json({ error: "Not enough tickets available" });
+    }
 
-    // Generate QR Code
-    let qrCode;
-    try {
+    const updatedEvent = await Event.findOneAndUpdate(
+      { _id: pendingTxn.eventId, Quantity: { $gte: pendingTxn.quantity } },
+      { $inc: { Quantity: -pendingTxn.quantity, ticketsSold: pendingTxn.quantity } },
+      { new: true }
+    );
+
+    if (!updatedEvent) {
+      delete req.session[lockKey]; // Release lock
+      return res.status(400).json({ error: "Failed to book tickets due to concurrency issue" });
+    }
+
+    const user = await UserModel.findById(userId);
+    if (!user) {
+      delete req.session[lockKey]; // Release lock
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const ticketPromises = [];
+
+    for (let i = 0; i < pendingTxn.quantity; i++) {
       const qrData = JSON.stringify({
         userId,
         eventId: pendingTxn.eventId,
-        bookingDate: new Date(),
-        transactionId: oid
+        purchaseId: pendingTxn.pid,
+        timestamp: new Date(),
       });
-      qrCode = await QRCode.toDataURL(qrData);
-    } catch (qrError) {
-      console.error("QR Error:", qrError);
-      return res.status(500).json({ error: "Failed to generate QR code" });
+
+      let qrCode;
+      try {
+        qrCode = await QRCode.toDataURL(qrData);
+      } catch (err) {
+        console.error("QR generation failed:", err.message);
+        delete req.session[lockKey]; // Release lock
+        return res.status(500).json({ error: "Failed to generate QR code" });
+      }
+
+      const ticket = new Ticket({
+        userid: userId,
+        eventid: pendingTxn.eventId,
+        purchaseId: pendingTxn.pid,
+        ticketDetails: {
+          name: user.name,
+          email: user.email,
+          eventname: event.title,
+          eventdate: event.eventDate,
+          eventtime: event.eventTime,
+          location: event.location,
+          image: event.image,
+          ticketprice: event.ticketPrice,
+          qr: qrCode
+        },
+        count: 1
+      });
+
+      ticketPromises.push(ticket.save());
     }
 
-    // Save ticket
-    // Instead of creating one ticket, create multiple
-const ticketPromises = [];
+    const savedTickets = await Promise.all(ticketPromises);
 
-for (let i = 0; i < pendingTxn.quantity; i++) {
-  // Generate unique data for each QR
-  const singleQRData = JSON.stringify({
-    userId,
-    eventId: pendingTxn.eventId,
-    bookingDate: new Date(),
-    ticketId: `${pendingTxn.pid}_ticket_${i + 1}`
-  });
+    // Delete the pending transaction to prevent duplicate processing
+    await PendingTransaction.deleteOne({ pid: oid });
+    
+    // Release the lock
+    delete req.session[lockKey];
 
-  const qr = await QRCode.toDataURL(singleQRData);
-
-  const newTicket = new Ticket({
-    userid: userId,
-    eventid: pendingTxn.eventId,
-    ticketDetails: {
-      name: req.user.name,
-      email: req.user.email,
-      eventname: event.title,
-      eventdate: event.eventDate,
-      eventtime: event.eventTime,
-      ticketprice: event.ticketPrice,
-      qr: qr
-    },
-    count: 1 // Each ticket is for 1 person
-  });
-
-  ticketPromises.push(newTicket.save());
-}
-
-await Promise.all(ticketPromises);
-
-    // Clear session
-    delete req.session.esewaTxn;
-
-    res.json({ message: "Payment confirmed and ticket booked!", ticket: newTicket });
+    res.json({
+      success: true,
+      ticket: savedTickets,
+      eventId: pendingTxn.eventId,
+      quantity: pendingTxn.quantity
+    });
 
   } catch (error) {
-    console.error("Error confirming payment:", error);
+    // Make sure to release the lock if there's an error
+    const lockKey = `payment_lock_${oid}`;
+    delete req.session[lockKey];
+    
+    console.error("Error confirming payment:", error.message);
+    res.status(500).json({ error: "Server error", details: error.message });
+  }
+});
+
+app.get("/check-payment-status/:purchaseId", authenticateUser, async (req, res) => {
+  try {
+    const purchaseId = req.params.purchaseId;
+    const userId = req.user.id;
+
+    // Check if we have tickets for this purchase
+    const tickets = await Ticket.find({ 
+      userid: userId,
+      purchaseId 
+    });
+
+    if (tickets.length === 0) {
+      return res.status(404).json({ error: "No tickets found for this purchase" });
+    }
+
+    // Return information without triggering another ticket creation
+    res.json({
+      success: true,
+      tickets: tickets, // Return all tickets as an array
+      eventId: tickets[0].eventid,
+      quantity: tickets.length
+    });
+  } catch (error) {
+    console.error("Error checking payment status:", error);
     res.status(500).json({ error: "Server error" });
   }
 });
 // Get latest ticket of logged-in user
+// Only keep this version
+// Get latest ticket of logged-in user
 app.get("/user/tickets/latest", authenticateUser, async (req, res) => {
   try {
-    const purchaseId = req.query.purchaseId;
+    const userId = req.user.id;
+    const oid = req.query.oid;
 
-    let query = { userid: req.user.id };
-    if (purchaseId) {
-      query.purchaseId = purchaseId;
+    let query = { userid: userId };
+    if (oid) {
+      query.purchaseId = oid;
     }
 
-    const tickets = await Ticket.find(query).sort({ createdAt: -1 });
+    // Fetch all tickets for this purchase or the latest tickets if no oid
+    const tickets = await Ticket.find(query).sort({ createdAt: -1 }).limit(oid ? 100 : 10);
 
     if (!tickets.length) {
       return res.status(404).json({ error: "No tickets found" });
     }
 
-    res.json(tickets);
-
+    // Only return the tickets, don't create new ones
+    res.json({ tickets });
   } catch (error) {
-    console.error("Error fetching user tickets:", error);
+    console.error("Error fetching tickets:", error.message);
     res.status(500).json({ error: "Server error" });
   }
 });
-// Add comment to an event
-app.post('/event/:eventId/comment', authenticateUser, async (req, res) => {
+// Book a Ticket (User Only)
+app.post("/bookTicket/:eventId", authenticateUser, async (req, res) => {
   const { eventId } = req.params;
-  const { text } = req.body;
   const userId = req.user.id;
+  const { name, email } = req.body;
+
+  if (!name || !email) {
+    return res.status(400).json({ error: "Name and email are required" });
+  }
 
   try {
+    // Step 1: Check event availability
     const event = await Event.findById(eventId);
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
 
-    const user = await UserModel.findById(userId).select('name email');
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
+    if (event.Quantity <= 0) {
+      return res.status(400).json({ error: "No tickets available for this event" });
     }
 
-    const newComment = {
-      text,
-      user: userId,
-      createdAt: new Date()
-    };
+    // Step 2: Update event atomically
+    const updatedEvent = await Event.findOneAndUpdate(
+      { _id: eventId, Quantity: { $gte: 1 } },
+      { $inc: { Quantity: -1, ticketsSold: 1 } },
+      { new: true }
+    );
 
-    event.comments.push(newComment);
-    await event.save();
+    if (!updatedEvent) {
+      return res.status(400).json({ error: "Not enough tickets available" });
+    }
 
-    // Return the comment with user details
-    res.status(201).json({
-      _id: newComment._id,
-      text: newComment.text,
-      createdAt: newComment.createdAt,
-      user: {
-        _id: user._id,
-        name: user.name,
-        email: user.email
-      }
+    // Step 3: Generate QR code
+    const qrData = JSON.stringify({
+      userId,
+      eventId,
+      bookingDate: new Date(),
     });
+
+    let qrCode;
+    try {
+      qrCode = await QRCode.toDataURL(qrData);
+    } catch (err) {
+      console.error("QR generation failed:", err.message);
+      return res.status(500).json({ error: "Failed to generate QR code" });
+    }
+
+    // Step 4: Save ticket
+    const newTicket = new Ticket({
+      userid: userId,
+      eventid: eventId,
+      ticketDetails: {
+        name,
+        email,
+        eventname: updatedEvent.title,
+        eventdate: updatedEvent.eventDate,
+        eventtime: updatedEvent.eventTime,
+        ticketprice: updatedEvent.ticketPrice,
+        qr: qrCode,
+      },
+      count: 1,
+    });
+
+    await newTicket.save();
+
+    res.status(201).json({ message: "Ticket booked successfully", ticket: newTicket });
+
   } catch (error) {
-    console.error("Error adding comment:", error);
-    res.status(500).json({ error: "Failed to add comment" });
+    console.error("Error booking ticket:", error.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-// Get comments for an event
+
 // Get comments for an event
 app.get('/event/:eventId/comments', async (req, res) => {
   const { eventId } = req.params;
@@ -490,8 +677,6 @@ app.delete("/organizer/:id", authenticateUser, isAdmin, async (req, res) => {
   }
 });
 
-
-
 // Create Event (Admin or Organizer)
 app.post("/createEvent", upload.single("image"), authenticateUser, isOrganizerOrAdmin, async (req, res) => {
   const { id, role, name } = req.user;
@@ -528,7 +713,7 @@ app.post("/createEvent", upload.single("image"), authenticateUser, isOrganizerOr
     for (const admin of admins) {
       await Notification.create({
         userId: admin._id,
-        message: `New event "${event.title}" created by ${name || "Unknown User"}`,
+        message: `New event "${event.title}" created  }`,
         relatedId: event._id,
         relatedType: "Event"
       });
@@ -650,7 +835,7 @@ app.put("/notifications/:notificationId/read", authenticateUser, async (req, res
     console.error("Error marking notification as read:", error);
     res.status(500).json({ error: "Failed to update notification" });
   }
-});// PUT /notifications/read-all
+});
 app.put("/notifications/read-all", authenticateUser, async (req, res) => {
   try {
     await Notification.updateMany(
@@ -664,44 +849,8 @@ app.put("/notifications/read-all", authenticateUser, async (req, res) => {
     res.status(500).json({ error: "Failed to update notifications" });
   }
 });
-// GET notifications for logged-in user
-app.get("/notifications", authenticateUser, async (req, res) => {
-  try {
-    const notifications = await Notification.find({ userId: req.user.id }).sort({ createdAt: -1 });
-    res.json(notifications);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch notifications" });
-  }
-});
 
-// PUT mark single notification as read
-app.put("/notifications/:notificationId/read", authenticateUser, async (req, res) => {
-  try {
-    const { notificationId } = req.params;
-    const notification = await Notification.findById(notificationId);
 
-    if (!notification || notification.userId.toString() !== req.user.id) {
-      return res.status(403).json({ error: "Unauthorized" });
-    }
-
-    notification.read = true;
-    await notification.save();
-
-    res.json({ message: "Notification marked as read" });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to update notification" });
-  }
-});
-
-// PUT mark all as read
-app.put("/notifications/read-all", authenticateUser, async (req, res) => {
-  try {
-    await Notification.updateMany({ userId: req.user.id }, { read: true });
-    res.json({ message: "All notifications marked as read" });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to update notifications" });
-  }
-});
 // Like Event (User Only)
 app.post("/event/:eventId/like", authenticateUser, async (req, res) => {
   const eventId = req.params.eventId;
@@ -746,22 +895,37 @@ app.put("/event/:eventId", upload.single("image"), authenticateUser, canModifyEv
   }
 });
 
-// Delete Event (Admin Only)
-app.delete("/event/:eventId", authenticateUser, canModifyEvent, async (req, res) => {
-  const { eventId } = req.params;
+app.post("/save-event/:eventId", authenticateUser, async (req, res) => {
+  const userId = req.user.id;
+  const eventId = req.params.eventId;
 
   try {
-    const deletedEvent = await Event.findByIdAndDelete(eventId);
-    if (!deletedEvent) {
-      console.log("Event not found:", eventId);
-      return res.status(404).json({ error: "Event not found" });
+    const user = await UserModel.findById(userId);
+
+    if (!user.savedEvents.includes(eventId)) {
+      user.savedEvents.push(eventId);
+      await user.save();
     }
 
-    console.log("Event deleted successfully:", deletedEvent);
-    res.json({ message: "Event deleted successfully" });
+    res.json({ message: "Event saved successfully", savedEvents: user.savedEvents });
   } catch (error) {
-    console.error("Error deleting event:", error);
-    res.status(500).json({ error: "Failed to delete event" });
+    console.error("Error saving event:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+app.delete("/unsave-event/:eventId", authenticateUser, async (req, res) => {
+  const userId = req.user.id;
+  const eventId = req.params.eventId;
+
+  try {
+    const user = await UserModel.findById(userId);
+    user.savedEvents = user.savedEvents.filter(id => id.toString() !== eventId);
+    await user.save();
+
+    res.json({ message: "Event removed from save list", savedEvents: user.savedEvents });
+  } catch (error) {
+    console.error("Error unsaving event:", error);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -789,40 +953,6 @@ app.put("/rejectEvent/:eventId", authenticateUser, isAdmin, async (req, res) => 
   }
 });
 
-app.delete("/event/:eventId", authenticateUser, canModifyEvent, async (req, res) => {
-  const { eventId } = req.params;
-
-  try {
-    const deletedEvent = await Event.findByIdAndDelete(eventId);
-    if (!deletedEvent) {
-      return res.status(404).json({ error: "Event not found" });
-    }
-
-    res.json({ message: "Event deleted successfully" });
-  } catch (error) {
-    console.error("Error deleting event:", error);
-    res.status(500).json({ error: "Failed to delete event" });
-  }
-});
-app.put("/event/:eventId", upload.single("image"), authenticateUser, canModifyEvent, async (req, res) => {
-  const { eventId } = req.params;
-  const updates = req.body;
-
-  try {
-    const event = await Event.findById(eventId);
-    if (req.file) {
-      event.image = `uploads/${req.file.filename}`;
-    }
-
-    Object.assign(event, updates);
-    await event.save();
-
-    res.json(event);
-  } catch (error) {
-    console.error("Error updating event:", error);
-    res.status(500).json({ error: "Failed to update event" });
-  }
-});
 
 // Delete Event (Organizer or Admin who owns the event)
 app.delete("/event/:eventId", authenticateUser, canModifyEvent, async (req, res) => {
@@ -844,81 +974,16 @@ app.delete("/event/:eventId", authenticateUser, canModifyEvent, async (req, res)
 // Get Events by Organizer ID
 app.get("/events/organizer/:organizerId", authenticateUser, async (req, res) => {
   try {
-    const events = await Event.find({ 
-      owner: req.params.organizerId // No need for ObjectId conversion if using string in model
-    });
-    
-    if (!events || events.length === 0) {
-      return res.status(200).json([]); // Return empty array if no events found
-    }
-    
-    res.status(200).json(events);
+    const ownerId = new mongoose.Types.ObjectId(req.params.organizerId);
+    const events = await Event.find({ owner: ownerId });
+    res.json(events);
   } catch (error) {
     console.error("Error fetching organizer events:", error);
-    res.status(500).json({ error: "Failed to fetch organizer events" });
+    res.status(500).json({ error: "Failed to fetch events" });
   }
 });
-// Book a Ticket (User Only)
-app.post("/bookTicket/:eventId", authenticateUser, async (req, res) => {
-  const { eventId } = req.params;
-  const userId = req.user.id;
 
-  try {
-    // Validate request body
-    const { name, email } = req.body;
-    if (!name || !email) {
-      return res.status(400).json({ error: "Name and email are required" });
-    }
 
-    // Atomically update the event
-    const updatedEvent = await Event.findByIdAndUpdate(
-      eventId,
-      { $inc: { Quantity: -1, ticketsSold: 1 } },
-      { new: true }
-    );
-
-    // Check if the event exists and has available tickets
-    if (!updatedEvent || updatedEvent.Quantity < 0) {
-      return res.status(400).json({ error: "No tickets available for this event" });
-    }
-
-    // Generate a unique QR code for the ticket
-    let qrCode;
-    try {
-      const qrData = JSON.stringify({
-        userId,
-        eventId,
-        bookingDate: new Date(),
-      });
-      qrCode = await QRCode.toDataURL(qrData);
-    } catch (qrError) {
-      console.error("Error generating QR code:", qrError);
-      return res.status(500).json({ error: "Failed to generate QR code" });
-    }
-
-    // Create a new ticket record
-    const newTicket = new Ticket({
-      userid: userId,
-      eventid: eventId,
-      ticketDetails: {
-        name,
-        email,
-        eventname: updatedEvent.title,
-        eventdate: updatedEvent.eventDate,
-        eventtime: updatedEvent.eventTime,
-        ticketprice: updatedEvent.ticketPrice,
-        qr: qrCode,
-      },
-      count: 1,
-    });
-
-    await newTicket.save();
-    res.status(201).json({ message: "Ticket booked successfully", ticket: newTicket });
-  } catch (error) {
-    console.error("Error booking ticket:", error.message, error.stack);
-    res.status(500).json({ error: "Server error" });
-  }
-});
 // Get Tickets by User ID (User Only)
 app.get("/tickets/user/:userId", authenticateUser, async (req, res) => {
   try {
@@ -955,33 +1020,115 @@ app.get("/admin/analytics", authenticateUser, isAdmin, async (req, res) => {
 
 // Get Organizer-Specific Analytics
 app.get("/organizer/analytics", authenticateUser, async (req, res) => {
-  const userId = req.user.id;
   try {
-    const eventIds = await Event.find({ owner: userId }).distinct("_id");
+    const userId = req.user.id;
 
-    const totalEvents = eventIds.length;
+    // Get all events owned by user
+    const events = await Event.find({ owner: userId });
+    const eventIds = events.map(event => event._id);
 
+    // Get all tickets booked for those events
     const tickets = await Ticket.find({ eventid: { $in: eventIds } });
 
+    // Calculate totals
+    let totalEvents = events.length;
     let totalTicketsSold = 0;
     let totalEarnings = 0;
 
     tickets.forEach(ticket => {
-      totalTicketsSold += ticket.quantity || 1; // Assuming 1 ticket per document if quantity not available
-      totalEarnings += (ticket.ticketDetails?.ticketprice || 0) * (ticket.quantity || 1);
+      const price = parseFloat(ticket.ticketDetails?.ticketprice || 0);
+      const quantity = parseInt(ticket.count || 1);
+
+      totalTicketsSold += quantity;
+      totalEarnings += price * quantity;
     });
 
     res.status(200).json({
       totalEvents,
       totalTicketsSold,
-      totalEarnings,
+      totalEarnings
     });
+
   } catch (error) {
     console.error("Error fetching organizer analytics:", error);
     res.status(500).json({ error: "Failed to fetch analytics" });
   }
 });
+app.post('/event/:eventId/comment', authenticateUser, async (req, res) => {
+  const { eventId } = req.params;
+  const { text } = req.body;
+  const userId = req.user.id;
 
+  try {
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    const user = await UserModel.findById(userId).select('name email');
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const newComment = {
+      text,
+      user: userId,
+      createdAt: new Date()
+    };
+
+    event.comments.push(newComment);
+    await event.save();
+
+    // Return the comment with user details
+    res.status(201).json({
+      _id: newComment._id,
+      text: newComment.text,
+      createdAt: newComment.createdAt,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email
+      }
+    });
+  } catch (error) {
+    console.error("Error adding comment:", error);
+    res.status(500).json({ error: "Failed to add comment" });
+  }
+});
+
+// Get comments for an event
+// Get comments for an event
+app.get('/event/:eventId/comments', async (req, res) => {
+  const { eventId } = req.params;
+
+  try {
+    const event = await Event.findById(eventId).populate({
+      path: 'comments.user',
+      select: 'name email' // Only select name and email
+    });
+    
+    if (!event) {
+      return res.status(404).json({ error: "Event not found" });
+    }
+
+    // Map through comments to ensure consistent structure
+    const formattedComments = event.comments.map(comment => ({
+      _id: comment._id,
+      text: comment.text,
+      createdAt: comment.createdAt,
+      user: {
+        _id: comment.user._id,
+        name: comment.user.name,
+        email: comment.user.email
+      }
+    }));
+
+    res.status(200).json(formattedComments);
+  } catch (error) {
+    console.error("Error fetching comments:", error);
+    res.status(500).json({ error: "Failed to fetch comments" });
+  }
+});
 // Start the Server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

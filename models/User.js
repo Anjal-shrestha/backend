@@ -1,4 +1,3 @@
-// models/User.js
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 const bcrypt = require('bcryptjs');
@@ -19,9 +18,16 @@ const UserSchema = new Schema({
   },
   role: {
     type: String,
-    enum: ['admin', 'user', 'organizer'], // Add "organizer" role
-    default: 'user', // Default role is "user"
+    enum: ['admin', 'user', 'organizer'],
+    default: 'user',
   },
+  // Wishlist/Saved Events Field
+  savedEvents: [
+    {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Event',
+    }
+  ]
 });
 
 // Hash password before saving
