@@ -2,12 +2,18 @@
 const mongoose = require("mongoose");
 
 const pendingTransactionSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-  eventId: { type: mongoose.Schema.Types.ObjectId, ref: "Event", required: true },
+  userId: { type: String, required: true },
+  eventId: { type: String, required: true },
   quantity: { type: Number, required: true },
   amount: { type: Number, required: true },
   pid: { type: String, required: true, unique: true },
-  createdAt: { type: Date, default: Date.now },
-});
+  status: { type: String, default: "pending" },
+  ticketType: {
+    type: String,
+    required: true,
+    enum: ['General', 'FanFest', 'VIP']
+  }
+}, { timestamps: true });
 
-module.exports = mongoose.model("PendingTransaction", pendingTransactionSchema);
+const PendingTransaction = mongoose.model("PendingTransaction", pendingTransactionSchema);
+module.exports = PendingTransaction;

@@ -1,4 +1,3 @@
-// models/Ticket.js
 const mongoose = require("mongoose");
 
 const ticketSchema = new mongoose.Schema({
@@ -22,12 +21,17 @@ const ticketSchema = new mongoose.Schema({
     eventname: { type: String, required: true },
     eventdate: { type: Date, required: true },
     eventtime: { type: String, required: true },
-      location: { type: String }, 
+    location: { type: String }, 
     image: { type: String }, 
     ticketprice: { type: Number, required: true },
+    ticketType: { 
+      type: String,
+      enum: ['General', 'FanFest', 'VIP'],
+      required: true
+    },
     qr: { type: String, required: true }
   },
-  count: { type: Number, default: 1 } // Always 1 per ticket
+  count: { type: Number, default: 1 }
 });
 
 const TicketModel = mongoose.model("Ticket", ticketSchema);

@@ -16,6 +16,7 @@ const Event = require("./models/Event");
 const Notification = require("./models/Notification");
 const app = express();
 const PendingTransaction = require("./models/PendingTransaction");
+const processedTransactions = new Map();
 // Constants
 const bcryptSalt = bcrypt.genSaltSync(10);
 const jwtSecret = process.env.JWT_SECRET || "default_secret";
@@ -33,7 +34,7 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(cors({ credentials: true, origin: "http://localhost:3000" }));
 
-// Ensure the 'uploads' directory exists
+// Ensure the 'uploads' directory <exists></exists>
 const uploadDir = './uploads';
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
@@ -279,43 +280,58 @@ app.post("/logout", (req, res) => {
 // Initiate eSewa Payment
 // POST /initiate-esewa-payment
 app.post("/initiate-esewa-payment", authenticateUser, async (req, res) => {
-  const { eventId, quantity } = req.body;
+  let { eventId, quantity, ticketType } = req.body;
+  
+  // Fallback if ticketType missing
+  if (!ticketType) {
+    ticketType = "General";
+  }
+
+  // Validate ticket type
+  if (!['General', 'FanFest', 'VIP'].includes(ticketType)) {
+    return res.status(400).json({ error: `Invalid ticket type: ${ticketType}` });
+  }
+
   const userId = req.user.id;
 
+  // Validate input
   if (!eventId || !quantity || quantity <= 0) {
-    return res.status(400).json({ error: "Invalid event ID or quantity" });
+    return res.status(400).json({ error: "Missing or invalid required fields" });
   }
 
   try {
+    // Step 1: Find event
     const event = await Event.findById(eventId);
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
 
-    const ticketPrice = parseFloat(event.ticketPrice);
-    if (isNaN(ticketPrice) || ticketPrice <= 0) {
-      return res.status(400).json({ error: "Invalid ticket price" });
+    // Step 2: Find selected ticket type
+    const selectedTicketType = event.ticketTypes.find(t => t.name === ticketType);
+
+    if (!selectedTicketType || selectedTicketType.quantity < quantity) {
+      return res.status(400).json({ error: "Selected ticket type not available in requested quantity" });
     }
 
-    const totalPrice = ticketPrice * parseInt(quantity);
+    const totalPrice = selectedTicketType.price * parseInt(quantity);
 
-    // Generate unique transaction ID
+    // Step 3: Generate unique transaction ID
     const pid = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    // Save transaction to DB
+    // Step 4: Save transaction
     const transaction = new PendingTransaction({
       userId,
       eventId,
       quantity,
       amount: totalPrice,
       pid,
-      status: "pending"
+      status: "pending",
+      ticketType
     });
 
     await transaction.save();
 
-    // Prepare eSewa form data
-    const esewaUrl = process.env.ESEWA_BASE_URL;
+    // Step 5: Prepare form data for eSewa
     const formData = {
       amt: totalPrice.toFixed(2),
       psc: 0,
@@ -324,93 +340,90 @@ app.post("/initiate-esewa-payment", authenticateUser, async (req, res) => {
       tAmt: totalPrice.toFixed(2),
       pid: pid,
       scd: process.env.ESEWA_MERCHANT_CODE,
-      su: `${process.env.PAYMENT_SUCCESS_URL}?userId=${userId}`,
-      fu: `${process.env.PAYMENT_FAILURE_URL}?userId=${userId}`
+      su: `${process.env.PAYMENT_SUCCESS_URL}?oid=${pid}`,
+      fu: `${process.env.PAYMENT_FAILURE_URL}?oid=${pid}`
     };
 
+    // Step 6: Return redirect URL + form data
+    const esewaUrl = process.env.ESEWA_BASE_URL;
     res.json({ redirectUrl: esewaUrl, formData });
+
   } catch (error) {
     console.error("Error initiating eSewa payment:", error.message);
     res.status(500).json({ error: "Failed to initiate eSewa payment" });
   }
 });
 
-// Confirm eSewa Payment and Book Ticket
-// POST /confirm-esewa-payment
 
 // Confirm eSewa Payment and Book Ticket
+
 app.post("/confirm-esewa-payment", authenticateUser, async (req, res) => {
   const { refId, oid } = req.body;
   const userId = req.user.id;
 
-  try {
-    // First, add a transaction lock check
-    const lockKey = `payment_lock_${oid}`;
-    if (req.session[lockKey]) {
-      return res.status(409).json({
-        success: true,
-        message: "Payment is already being processed",
-      });
-    }
-    
-    // Set a lock
-    req.session[lockKey] = true;
+  if (!oid || !refId) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
 
-    // Check if this transaction exists and belongs to this user
+  try {
+    // Step 1: Find pending transaction
     const pendingTxn = await PendingTransaction.findOne({ pid: oid });
+
     if (!pendingTxn || pendingTxn.userId.toString() !== userId) {
-      delete req.session[lockKey]; // Release lock
       return res.status(400).json({ error: "Invalid or unauthorized transaction" });
     }
 
-    // IMPORTANT: Check if tickets were already generated for this transaction
+    // Step 2: Check if tickets already exist
     const existingTickets = await Ticket.find({ purchaseId: oid });
     if (existingTickets.length > 0) {
-      delete req.session[lockKey]; // Release lock
-      return res.status(200).json({
-        success: true,
-        message: "Tickets already generated for this transaction",
-        ticket: existingTickets,
+      return res.json({
+        tickets: existingTickets,
         eventId: pendingTxn.eventId,
         quantity: existingTickets.length
       });
     }
 
+    // Step 3: Fetch event & user
     const event = await Event.findById(pendingTxn.eventId);
-    if (!event) {
-      delete req.session[lockKey]; // Release lock
-      return res.status(404).json({ error: "Event not found" });
+    const user = await UserModel.findById(userId);
+
+    if (!event || !user) {
+      return res.status(404).json({ error: "Event or user not found" });
     }
 
-    if (event.Quantity < pendingTxn.quantity) {
-      delete req.session[lockKey]; // Release lock
+    // Step 4: Validate ticket type
+    if (!['General', 'FanFest', 'VIP'].includes(pendingTxn.ticketType)) {
+      return res.status(400).json({ error: "Invalid ticket type in transaction" });
+    }
+
+    const selectedTicketType = event.ticketTypes.find(t => t.name === pendingTxn.ticketType);
+    if (!selectedTicketType || selectedTicketType.quantity < pendingTxn.quantity) {
       return res.status(400).json({ error: "Not enough tickets available" });
     }
 
+    // Step 5: Update event inventory atomically
     const updatedEvent = await Event.findOneAndUpdate(
-      { _id: pendingTxn.eventId, Quantity: { $gte: pendingTxn.quantity } },
-      { $inc: { Quantity: -pendingTxn.quantity, ticketsSold: pendingTxn.quantity } },
+      { _id: pendingTxn.eventId, "ticketTypes.name": pendingTxn.ticketType },
+      {
+        $inc: {
+          "ticketTypes.$.quantity": -pendingTxn.quantity,
+          "ticketTypes.$.sold": +pendingTxn.quantity
+        }
+      },
       { new: true }
     );
 
     if (!updatedEvent) {
-      delete req.session[lockKey]; // Release lock
-      return res.status(400).json({ error: "Failed to book tickets due to concurrency issue" });
+      throw new Error("Failed to update event inventory");
     }
 
-    const user = await UserModel.findById(userId);
-    if (!user) {
-      delete req.session[lockKey]; // Release lock
-      return res.status(404).json({ error: "User not found" });
-    }
-
+    // Step 6: Generate tickets with QR codes
     const ticketPromises = [];
-
     for (let i = 0; i < pendingTxn.quantity; i++) {
       const qrData = JSON.stringify({
         userId,
         eventId: pendingTxn.eventId,
-        purchaseId: pendingTxn.pid,
+        purchaseId: oid,
         timestamp: new Date(),
       });
 
@@ -418,15 +431,13 @@ app.post("/confirm-esewa-payment", authenticateUser, async (req, res) => {
       try {
         qrCode = await QRCode.toDataURL(qrData);
       } catch (err) {
-        console.error("QR generation failed:", err.message);
-        delete req.session[lockKey]; // Release lock
-        return res.status(500).json({ error: "Failed to generate QR code" });
+        throw new Error("Failed to generate QR code");
       }
 
       const ticket = new Ticket({
         userid: userId,
         eventid: pendingTxn.eventId,
-        purchaseId: pendingTxn.pid,
+        purchaseId: oid,
         ticketDetails: {
           name: user.name,
           email: user.email,
@@ -435,7 +446,8 @@ app.post("/confirm-esewa-payment", authenticateUser, async (req, res) => {
           eventtime: event.eventTime,
           location: event.location,
           image: event.image,
-          ticketprice: event.ticketPrice,
+          ticketprice: selectedTicketType.price,
+          ticketType: selectedTicketType.name,
           qr: qrCode
         },
         count: 1
@@ -446,26 +458,18 @@ app.post("/confirm-esewa-payment", authenticateUser, async (req, res) => {
 
     const savedTickets = await Promise.all(ticketPromises);
 
-    // Delete the pending transaction to prevent duplicate processing
+    // Step 7: Clean up
     await PendingTransaction.deleteOne({ pid: oid });
-    
-    // Release the lock
-    delete req.session[lockKey];
 
     res.json({
-      success: true,
-      ticket: savedTickets,
+      tickets: savedTickets,
       eventId: pendingTxn.eventId,
-      quantity: pendingTxn.quantity
+      quantity: savedTickets.length
     });
 
   } catch (error) {
-    // Make sure to release the lock if there's an error
-    const lockKey = `payment_lock_${oid}`;
-    delete req.session[lockKey];
-    
     console.error("Error confirming payment:", error.message);
-    res.status(500).json({ error: "Server error", details: error.message });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -496,30 +500,30 @@ app.get("/check-payment-status/:purchaseId", authenticateUser, async (req, res) 
     res.status(500).json({ error: "Server error" });
   }
 });
-// Get latest ticket of logged-in user
-// Only keep this version
-// Get latest ticket of logged-in user
+
 app.get("/user/tickets/latest", authenticateUser, async (req, res) => {
   try {
     const userId = req.user.id;
-    const oid = req.query.oid;
+    const { oid } = req.query;
 
     let query = { userid: userId };
     if (oid) {
       query.purchaseId = oid;
     }
 
-    // Fetch all tickets for this purchase or the latest tickets if no oid
-    const tickets = await Ticket.find(query).sort({ createdAt: -1 }).limit(oid ? 100 : 10);
+    // Get all tickets for this purchase or latest ones
+    const tickets = await Ticket.find(query)
+      .sort({ createdAt: -1 })
+      .limit(oid ? 100 : 10);
 
     if (!tickets.length) {
       return res.status(404).json({ error: "No tickets found" });
     }
 
-    // Only return the tickets, don't create new ones
     res.json({ tickets });
+
   } catch (error) {
-    console.error("Error fetching tickets:", error.message);
+    console.error("Error fetching latest tickets:", error.message);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -527,39 +531,55 @@ app.get("/user/tickets/latest", authenticateUser, async (req, res) => {
 app.post("/bookTicket/:eventId", authenticateUser, async (req, res) => {
   const { eventId } = req.params;
   const userId = req.user.id;
-  const { name, email } = req.body;
+  const { name, email, ticketType = "General" } = req.body;
 
+  // Validate inputs
   if (!name || !email) {
     return res.status(400).json({ error: "Name and email are required" });
   }
 
+  if (!['General', 'FanFest', 'VIP'].includes(ticketType)) {
+    return res.status(400).json({ error: `Invalid ticket type: ${ticketType}` });
+  }
+
   try {
-    // Step 1: Check event availability
+    // Step 1: Find event
     const event = await Event.findById(eventId);
+
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
 
-    if (event.Quantity <= 0) {
-      return res.status(400).json({ error: "No tickets available for this event" });
+    // Step 2: Find selected ticket type
+    const selectedTicketType = event.ticketTypes.find(t => t.name === ticketType);
+
+    if (!selectedTicketType || selectedTicketType.quantity <= 0) {
+      return res.status(400).json({ error: "Selected ticket type not available" });
     }
 
-    // Step 2: Update event atomically
+    // Step 3: Update event inventory atomically
     const updatedEvent = await Event.findOneAndUpdate(
-      { _id: eventId, Quantity: { $gte: 1 } },
-      { $inc: { Quantity: -1, ticketsSold: 1 } },
+      { _id: eventId, "ticketTypes.name": ticketType },
+      {
+        $inc: {
+          "ticketTypes.$.quantity": -1,
+          "ticketTypes.$.sold": 1
+        }
+      },
       { new: true }
     );
 
     if (!updatedEvent) {
-      return res.status(400).json({ error: "Not enough tickets available" });
+      return res.status(400).json({ error: "Failed to book ticket" });
     }
 
-    // Step 3: Generate QR code
+    // Step 4: Generate QR Code
+    const purchaseId = `TICKET-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const qrData = JSON.stringify({
       userId,
       eventId,
-      bookingDate: new Date(),
+      purchaseId,
+      timestamp: new Date(),
     });
 
     let qrCode;
@@ -570,25 +590,33 @@ app.post("/bookTicket/:eventId", authenticateUser, async (req, res) => {
       return res.status(500).json({ error: "Failed to generate QR code" });
     }
 
-    // Step 4: Save ticket
-    const newTicket = new Ticket({
+    // Step 5: Save ticket
+    const ticket = new TicketModel({
       userid: userId,
       eventid: eventId,
+      purchaseId,
       ticketDetails: {
         name,
         email,
-        eventname: updatedEvent.title,
-        eventdate: updatedEvent.eventDate,
-        eventtime: updatedEvent.eventTime,
-        ticketprice: updatedEvent.ticketPrice,
-        qr: qrCode,
+        eventname: event.title,
+        eventdate: event.eventDate,
+        eventtime: event.eventTime,
+        location: event.location,
+        image: event.image,
+        ticketprice: selectedTicketType.price,
+        ticketType: selectedTicketType.name,
+        qr: qrCode
       },
-      count: 1,
+      count: 1
     });
 
-    await newTicket.save();
+    await ticket.save();
 
-    res.status(201).json({ message: "Ticket booked successfully", ticket: newTicket });
+    // Step 6: Return full ticket data
+    res.json({
+      ticket,
+      message: "Ticket booked successfully"
+    });
 
   } catch (error) {
     console.error("Error booking ticket:", error.message);
@@ -661,7 +689,76 @@ app.get("/organizers", authenticateUser, isAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch organizers" });
   }
 });
+app.get("/organizer/events", authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
 
+    // Step 1: Get all events owned by user
+    const events = await Event.find({ owner: userId }).sort({ createdAt: -1 });
+
+    // Step 2: Get all tickets for those events
+    const eventIds = events.map(event => event._id);
+    const tickets = await Ticket.find({ eventid: { $in: eventIds } });
+
+    // Step 3: Group tickets by event
+    const ticketStats = {};
+
+    tickets.forEach(ticket => {
+      const eventId = ticket.eventid;
+      const ticketType = ticket.ticketDetails?.ticketType || "General";
+      const quantity = parseInt(ticket.count || 1);
+      const event = events.find(e => e._id.toString() === eventId);
+
+      if (!event) return;
+
+      if (!ticketStats[eventId]) {
+        ticketStats[eventId] = {
+          General: 0,
+          FanFest: 0,
+          VIP: 0,
+          earnings: 0
+        };
+      }
+
+      const basePrice = event.ticketTypes.find(t => t.name === ticketType)?.price || 0;
+
+      // Apply phase discount
+      const purchaseDate = new Date(ticket.createdAt);
+      const activePhase = event.salePhases?.find(phase => {
+        const start = new Date(phase.startDate);
+        const end = new Date(phase.endDate);
+        return purchaseDate >= start && purchaseDate <= end;
+      });
+
+      const finalPrice = activePhase && activePhase.discountPercent > 0
+        ? Math.round(basePrice * (1 - activePhase.discountPercent / 100))
+        : basePrice;
+
+      // Increment count based on ticket type
+      if (['General', 'FanFest', 'VIP'].includes(ticketType)) {
+        ticketStats[eventId][ticketType] += quantity;
+        ticketStats[eventId].earnings += finalPrice * quantity;
+      }
+    });
+
+    // Step 4: Attach stats to each event
+    const enrichedEvents = events.map(event => ({
+      ...event.toObject(),
+      breakdown: ticketStats[event._id.toString()] || {
+        General: 0,
+        FanFest: 0,
+        VIP: 0,
+        earnings: 0
+      }
+    }));
+
+    res.status(200).json(enrichedEvents);
+
+  } catch (error) {
+    console.error("Error fetching organizer events:", error.message);
+    res.status(500).json({ error: "Failed to load events" });
+  }
+});
 // Delete Organizer (Admin Only)
 app.delete("/organizer/:id", authenticateUser, isAdmin, async (req, res) => {
   const { id } = req.params;
@@ -678,51 +775,131 @@ app.delete("/organizer/:id", authenticateUser, isAdmin, async (req, res) => {
 });
 
 // Create Event (Admin or Organizer)
-app.post("/createEvent", upload.single("image"), authenticateUser, isOrganizerOrAdmin, async (req, res) => {
-  const { id, role, name } = req.user;
-  const eventData = req.body;
+app.post(
+  "/createEvent",
+  upload.single("image"),
+  authenticateUser,
+  isOrganizerOrAdmin,
+  async (req, res) => {
+    const { id, role, name } = req.user;
+
+    let eventData = { ...req.body };
+ if (eventData.salePhases && typeof eventData.salePhases === "string") {
+      try {
+        eventData.salePhases = JSON.parse(eventData.salePhases);
+      } catch (err) {
+        return res.status(400).json({ error: "Invalid salePhases format" });
+      }
+    }
+    try {
+      // 🔁 Restore this part — fetch full organizer
+      const organizer = await UserModel.findById(id);
+      if (!organizer) {
+        return res.status(404).json({ error: "Organizer not found" });
+      }
+
+      // Validate user ID
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ error: "Invalid user ID" });
+      }
+
+      // Parse ticketTypes if provided
+      if (eventData.ticketTypes && typeof eventData.ticketTypes === "string") {
+        try {
+          eventData.ticketTypes = JSON.parse(eventData.ticketTypes);
+        } catch (err) {
+          return res.status(400).json({ error: "Invalid ticketTypes format" });
+        }
+      }
+
+      // Validate each ticket type
+      if (Array.isArray(eventData.ticketTypes)) {
+        eventData.ticketTypes.forEach((type) => {
+          if (!['General', 'FanFest', 'VIP'].includes(type.name)) {
+            throw new Error(`Invalid ticket type: ${type.name}`);
+          }
+          const price = parseFloat(type.price);
+          const quantity = parseInt(type.quantity);
+
+          if (isNaN(price) || price <= 0) {
+            throw new Error(`Invalid price for ${type.name}`);
+          }
+          if (isNaN(quantity) || quantity < 0) {
+            throw new Error(`Invalid quantity for ${type.name}`);
+          }
+
+          type.price = price;
+          type.quantity = quantity;
+        });
+      }
+
+      // Handle image upload
+      if (req.file) {
+        eventData.image = `uploads/${req.file.filename}`;
+      }
+
+      // ✅ Use organizer.name instead of req.user.name
+      eventData.owner = id;
+      eventData.organizedBy = organizer.name; // ✅ This is what was missing
+      eventData.approved = role === "admin";
+
+      // Create and save event
+      const newEvent = new Event(eventData);
+      await newEvent.save();
+
+      // Notify admins
+      const admins = await UserModel.find({ role: "admin" });
+      for (const admin of admins) {
+        await Notification.create({
+          userId: admin._id,
+          message: `New event "${newEvent.title}" created`,
+          relatedId: newEvent._id,
+          relatedType: "Event"
+        });
+      }
+
+      res.status(201).json(newEvent);
+
+    } catch (err) {
+      console.error("Error creating event:", err.message);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+app.put("/edit-event/:eventId", upload.single("image"), authenticateUser, async (req, res) => {
+  const { eventId } = req.params;
+
+  let eventData = { ...req.body };
+
+  // Parse ticketTypes if provided as string
+  if (eventData.ticketTypes && typeof eventData.ticketTypes === "string") {
+    try {
+      eventData.ticketTypes = JSON.parse(eventData.ticketTypes);
+    } catch (err) {
+      return res.status(400).json({ error: "Invalid ticketTypes format" });
+    }
+  }
+
+  // Handle image upload if any
+  if (req.file) {
+    eventData.image = `uploads/${req.file.filename}`;
+  }
 
   try {
-    // Fetch the organizer's details from the database
-    const organizer = await UserModel.findById(id);
-    if (!organizer) {
-      return res.status(404).json({ error: "Organizer not found" });
+    const updatedEvent = await Event.findByIdAndUpdate(eventId, eventData, {
+      new: true,
+      runValidators: true
+    });
+
+    if (!updatedEvent) {
+      return res.status(404).json({ error: "Event not found" });
     }
 
-    // Validate and set the owner field
-    if (!mongoose.isValidObjectId(id)) {
-      return res.status(400).json({ error: "Invalid user ID" });
-    }
-    eventData.owner = new mongoose.Types.ObjectId(id);
+    res.json(updatedEvent);
 
-    // Set other event fields
-    eventData.image = req.file ? `uploads/${req.file.filename}` : "";
-    eventData.organizedBy = organizer.name;
-    eventData.approved = role === "admin";
-
-    // Create and save the event
-    const newEvent = new Event(eventData);
-    await newEvent.save();
-
-    // Now that event is saved, fetch fully populated event
-    const event = await Event.findById(newEvent._id); // or populate if needed
-
-    // Notify all admins
-    const admins = await UserModel.find({ role: "admin" });
-
-    for (const admin of admins) {
-      await Notification.create({
-        userId: admin._id,
-        message: `New event "${event.title}" created  }`,
-        relatedId: event._id,
-        relatedType: "Event"
-      });
-    }
-
-    res.status(201).json(newEvent);
   } catch (err) {
-    console.error("Error creating event:", err);
-    res.status(500).json({ error: "Failed to save the event", details: err.message });
+    console.error("Error updating event:", err.message);
+    res.status(500).json({ error: "Failed to update event" });
   }
 });
 // Approve Event (Admin Only)
@@ -976,10 +1153,59 @@ app.get("/events/organizer/:organizerId", authenticateUser, async (req, res) => 
   try {
     const ownerId = new mongoose.Types.ObjectId(req.params.organizerId);
     const events = await Event.find({ owner: ownerId });
-    res.json(events);
+
+    if (!events.length) {
+      return res.json([]);
+    }
+
+    const eventIds = events.map(event => event._id.toString());
+    const tickets = await Ticket.find({ eventid: { $in: eventIds } });
+
+    const enrichedEvents = events.map(event => {
+      const eventStrId = event._id.toString();
+      const eventTickets = tickets.filter(t => t.eventid === eventStrId);
+
+      const breakdown = {
+        General: 0,
+        FanFest: 0,
+        VIP: 0,
+        earnings: 0
+      };
+
+      eventTickets.forEach(ticket => {
+        const ticketType = ticket.ticketDetails?.ticketType || "General";
+        const quantity = parseInt(ticket.count || 1);
+        const ticketTypeData = event.ticketTypes.find(t => t.name === ticketType);
+        const basePrice = ticketTypeData ? ticketTypeData.price : 0;
+
+        const purchaseDate = new Date(ticket.createdAt);
+        const activePhase = event.salePhases?.find(phase => {
+          const start = new Date(phase.startDate);
+          const end = new Date(phase.endDate);
+          return purchaseDate >= start && purchaseDate <= end;
+        });
+
+        const finalPrice = activePhase
+          ? Math.round(basePrice * (1 - activePhase.discountPercent / 100))
+          : basePrice;
+
+        if (['General', 'FanFest', 'VIP'].includes(ticketType)) {
+          breakdown[ticketType] += quantity;
+          breakdown.earnings += finalPrice * quantity;
+        }
+      });
+
+      return {
+        ...event.toObject(),
+        breakdown
+      };
+    });
+
+    res.status(200).json(enrichedEvents);
+
   } catch (error) {
-    console.error("Error fetching organizer events:", error);
-    res.status(500).json({ error: "Failed to fetch events" });
+    console.error("Error fetching organizer events:", error.message);
+    res.status(500).json({ error: "Failed to load events" });
   }
 });
 
@@ -1023,34 +1249,67 @@ app.get("/organizer/analytics", authenticateUser, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Get all events owned by user
+    // Step 1: Get all events owned by user
     const events = await Event.find({ owner: userId });
     const eventIds = events.map(event => event._id);
 
-    // Get all tickets booked for those events
+    // Step 2: Get all tickets for those events
     const tickets = await Ticket.find({ eventid: { $in: eventIds } });
 
-    // Calculate totals
-    let totalEvents = events.length;
+    // Step 3: Initialize counters
+    const ticketTypeStats = {
+      General: { sold: 0, earnings: 0 },
+      FanFest: { sold: 0, earnings: 0 },
+      VIP: { sold: 0, earnings: 0 }
+    };
+
     let totalTicketsSold = 0;
     let totalEarnings = 0;
 
-    tickets.forEach(ticket => {
-      const price = parseFloat(ticket.ticketDetails?.ticketprice || 0);
+    // Step 4: Process each ticket
+    for (const ticket of tickets) {
+      const event = await Event.findById(ticket.eventid);
+      if (!event) continue;
+
+      const ticketType = ticket.ticketDetails?.ticketType;
+      if (!['General', 'FanFest', 'VIP'].includes(ticketType)) continue;
+
+      const ticketTypeData = event.ticketTypes.find(t => t.name === ticketType);
+      if (!ticketTypeData) continue;
+
+      const basePrice = ticketTypeData.price;
       const quantity = parseInt(ticket.count || 1);
+      const purchaseDate = new Date(ticket.createdAt);
+
+      // Apply phase discount if applicable
+      const activePhase = event.salePhases?.find(phase => {
+        const start = new Date(phase.startDate);
+        const end = new Date(phase.endDate);
+        return purchaseDate >= start && purchaseDate <= end;
+      });
+
+      const finalPrice = activePhase
+        ? Math.round(basePrice * (1 - activePhase.discountPercent / 100))
+        : basePrice;
+
+      // Update stats
+      ticketTypeStats[ticketType].sold += quantity;
+      ticketTypeStats[ticketType].earnings += finalPrice * quantity;
 
       totalTicketsSold += quantity;
-      totalEarnings += price * quantity;
-    });
+      totalEarnings += finalPrice * quantity;
+    }
 
+    // Step 5: Return detailed analytics
     res.status(200).json({
-      totalEvents,
+      totalEvents: events.length,
       totalTicketsSold,
-      totalEarnings
+      totalEarnings,
+      breakdown: ticketTypeStats
     });
 
   } catch (error) {
-    console.error("Error fetching organizer analytics:", error);
+    console.error("Error fetching organizer analytics:", error.message);
     res.status(500).json({ error: "Failed to fetch analytics" });
   }
 });
