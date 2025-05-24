@@ -907,18 +907,14 @@ app.put("/approveEvent/:eventId", authenticateUser, isAdmin, async (req, res) =>
   const { eventId } = req.params;
 
   try {
-    // Fetch event with owner populated
     const event = await Event.findById(eventId).populate("owner");
-    
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
 
-    // Approve event
-    event.approved = true;
+    event.status = "approved";
     await event.save();
 
-    // Create notification for organizer
     if (event.owner && event.owner._id) {
       await Notification.create({
         userId: event.owner._id,
@@ -926,11 +922,19 @@ app.put("/approveEvent/:eventId", authenticateUser, isAdmin, async (req, res) =>
         relatedId: event._id,
         relatedType: "Event"
       });
-    } else {
-      console.warn("Owner not found or missing for event:", eventId);
     }
 
-    res.status(200).json({ message: "Event approved successfully", event });
+   const updatedEvent = await Event.findById(eventId).populate("owner");
+updatedEvent.approved = true;
+await updatedEvent.save();
+
+res.status(200).json({
+  message: "Event approved successfully",
+  event: {
+    ...updatedEvent.toObject(),
+    approved: updatedEvent.status === "approved"
+  }
+});
   } catch (error) {
     console.error("Error approving event:", error);
     res.status(500).json({ error: "Server error" });
@@ -1109,21 +1113,40 @@ app.delete("/unsave-event/:eventId", authenticateUser, async (req, res) => {
 // Reject Event (Admin Only)
 app.put("/rejectEvent/:eventId", authenticateUser, isAdmin, async (req, res) => {
   const { eventId } = req.params;
-  const event = await Event.findById(req.params.eventId).populate("owner");
-  await Notification.create({
-    userId: event.owner._id,
-    message: `Your event "${event.title}" has been rejected.`,
-    relatedId: event._id,
-    relatedType: "Event"
-  });
+
   try {
-    const event = await Event.findById(eventId);
+    const event = await Event.findById(eventId).populate("owner");
+
     if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
-    event.approved = false;
+
+    event.status = "rejected";
     await event.save();
-    res.status(200).json({ message: "Event rejected successfully", event });
+
+    // Notify owner
+    if (event.owner && event.owner._id) {
+      await Notification.create({
+        userId: event.owner._id,
+        message: `Your event "${event.title}" has been rejected.`,
+        relatedId: event._id,
+        relatedType: "Event"
+      });
+    }
+
+    // Include legacy `approved` field for frontend compatibility
+    const updatedEvent = await Event.findById(eventId).populate("owner");
+    updatedEvent.approved = false;
+    await updatedEvent.save();
+
+    res.status(200).json({
+      message: "Event rejected successfully",
+      event: {
+        ...updatedEvent.toObject(),
+        approved: updatedEvent.status === "approved"
+      }
+    });
+
   } catch (error) {
     console.error("Error rejecting event:", error);
     res.status(500).json({ error: "Server error" });

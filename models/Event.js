@@ -1,11 +1,12 @@
 const mongoose = require("mongoose");
 const { Schema } = mongoose;
 
+// Ticket Type Schema
 const ticketTypeSchema = new Schema({
   name: {
     type: String,
     required: true,
-    enum: ['General', 'FanFest', 'VIP'] // Optional: restrict to these only
+    enum: ['General', 'FanFest', 'VIP']
   },
   price: {
     type: Number,
@@ -21,6 +22,7 @@ const ticketTypeSchema = new Schema({
   }
 });
 
+// Sale Phase Schema
 const salePhaseSchema = new Schema({
   phase: {
     type: String,
@@ -42,6 +44,7 @@ const salePhaseSchema = new Schema({
   }
 });
 
+// Event Schema
 const eventSchema = new Schema({
   owner: {
     type: mongoose.Schema.Types.ObjectId,
@@ -65,8 +68,14 @@ const eventSchema = new Schema({
     },
     createdAt: { type: Date, default: Date.now }
   }],
-  approved: { type: Boolean, default: false },
   
+  // ✅ Use status instead of approved
+  status: {
+    type: String,
+    enum: ['pending', 'approved', 'rejected'],
+    default: 'pending'
+  },
+
   // New fields
   ticketTypes: [ticketTypeSchema], // Multiple ticket types
   salePhases: [salePhaseSchema]    // Phased ticket sales
