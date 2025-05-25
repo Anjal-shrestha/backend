@@ -925,7 +925,7 @@ app.put("/approveEvent/:eventId", authenticateUser, isAdmin, async (req, res) =>
     }
 
    const updatedEvent = await Event.findById(eventId).populate("owner");
-updatedEvent.approved = true;
+updatedEvent.status = "approved";
 await updatedEvent.save();
 
 res.status(200).json({
@@ -954,9 +954,9 @@ app.get("/events", async (req, res) => {
         if (err) return; // Token is invalid; treat as unauthenticated
 
         // Authenticated user: Filter based on role
-        if (userData.role === "user") {
-          query.approved = true; // Regular users see only approved events
-        }
+       if (userData.role === "user") {
+  query.status = "approved";
+}
         // Admins and organizers see all events (no filtering)
       });
     } else {
@@ -1136,7 +1136,7 @@ app.put("/rejectEvent/:eventId", authenticateUser, isAdmin, async (req, res) => 
 
     // Include legacy `approved` field for frontend compatibility
     const updatedEvent = await Event.findById(eventId).populate("owner");
-    updatedEvent.approved = false;
+    event.status = "rejected";
     await updatedEvent.save();
 
     res.status(200).json({
