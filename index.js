@@ -942,34 +942,31 @@ res.status(200).json({
 });
 
 // Get All Events (Public Access with Filtering)
+// ✅ Updated /events route logic
 app.get("/events", async (req, res) => {
   try {
-    // Check if the user is authenticated
     const token = req.cookies.token;
     let query = {};
 
     if (token) {
-      // If authenticated, verify the token and determine the user's role
       jwt.verify(token, jwtSecret, (err, userData) => {
-        if (err) return; // Token is invalid; treat as unauthenticated
+        if (err) return; // Invalid token → treat as unauthenticated
 
-        // Authenticated user: Filter based on role
-       if (userData.role === "user") {
-  query.status = "approved";
-}
-        // Admins and organizers see all events (no filtering)
+        if (userData.role === "user") {
+          query.status = "approved"; // ✅ Use status field consistently
+        }
+        // Admins & organizers see all events
       });
     } else {
-      // Unauthenticated user: Only show approved events
-      query.approved = true;
+      // Unauthenticated user → only approved events
+      query.status = "approved"; // ✅ Changed from approved to status
     }
 
-    // Fetch events based on the query
     const events = await Event.find(query);
-    res.status(200).json(events);
+    res.json(events);
   } catch (error) {
     console.error("Error fetching events:", error);
-    res.status(500).json({ error: "Failed to fetch events from MongoDB" });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
